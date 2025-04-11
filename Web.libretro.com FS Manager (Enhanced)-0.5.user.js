@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         Web.libretro.com FS Manager (Enhanced)
+// @name         Web.libretro.com FS Manager
 // @namespace    http://tampermonkey.net/
-// @version      0.5
-// @description  Adds a file manager UI with context menus and copy/move for Module.FS on web.libretro.com
-// @author       Your Name (or AI)
+// @version      1.2
+// @description  优化后的文件管理器：复制和移动操作需要两步，第一次点击“复制”或“移动”后进入待执行状态，此时待执行按钮会常驻，即使切换目录，仍可点击“复制到此处”或“移动到此处”执行操作；重命名操作依然按原逻辑。支持导入和导出。
+// @author       Your Name
 // @match        *://web.libretro.com/*
 // @grant        GM_addStyle
 // @run-at       document-idle
@@ -12,19 +12,27 @@
 (function() {
     'use strict';
 
-    // --- Configuration ---
-    const initialPath = '/'; // Starting directory
+    // --- 配置 ---
+    const initialPath = '/home/web_user/retroarch/userdata/content';
     const managerTitle = 'FS Manager';
-    const toggleButtonText = '☰ FS'; // Text for the button to open/close the manager
-    const menuIconChar = '⋮'; // Character for the context menu trigger
+    const toggleButtonText = '☰ FS';
 
-    // --- Styles ---
+    // --- 状态变量 ---
+    let currentPath = initialPath;
+    let fsModule = null; // Module.FS 对象
+    let selectedItems = []; // 当前选中的待操作的文件或目录（多选）
+    // pending 状态：pendingOp 为 "copy" 或 "move" 或 null
+    let pendingOp = null;
+    // pendingItems 保存第一次点击时选中的项（后续不随当前选中变化）
+    let pendingItems = [];
+
+    // --- CSS 样式 ---
     GM_addStyle(`
         #fs-manager-container {
             position: fixed;
             top: 50px;
             right: 10px;
-            width: 450px;
+            width: 650px;
             max-height: 70vh;
             background-color: #f0f0f0;
             border: 1px solid #ccc;
@@ -33,7 +41,7 @@
             font-family: sans-serif;
             font-size: 14px;
             color: #333;
-            display: none; /* Hidden by default */
+            display: none;
             flex-direction: column;
         }
         #fs-manager-header {
@@ -58,11 +66,12 @@
             border-bottom: 1px solid #ccc;
             word-break: break-all;
         }
-         #fs-manager-controls {
+        #fs-manager-controls {
             padding: 8px;
             border-bottom: 1px solid #ccc;
             display: flex;
-            gap: 10px;
+            gap: 8px;
+            flex-wrap: wrap;
             align-items: center;
         }
         #fs-manager-controls button {
@@ -72,43 +81,35 @@
             background-color: #ddd;
             border-radius: 3px;
         }
+        /* 待执行操作按钮 */
+        #fs-manager-pending-op-btn {
+            padding: 4px 8px;
+            cursor: pointer;
+            border: 1px solid #f00;
+            background-color: #fee;
+            border-radius: 3px;
+        }
         #fs-manager-list {
             list-style: none;
             padding: 0;
             margin: 0;
             overflow-y: auto;
             flex-grow: 1;
-            position: relative; /* Needed for context menu positioning */
         }
         #fs-manager-list li {
             padding: 5px 8px;
             border-bottom: 1px solid #eee;
             display: flex;
-            justify-content: space-between;
             align-items: center;
-            cursor: pointer;
+            gap: 5px;
         }
         #fs-manager-list li:hover {
             background-color: #e8f0fe;
         }
         #fs-manager-list li span.item-name {
-           flex-grow: 1;
-           margin-right: 10px;
-           word-break: break-all;
-           pointer-events: none; /* Prevent name click from interfering with li click */
+            flex-grow: 1;
+            word-break: break-all;
         }
-        #fs-manager-list li .item-menu-btn {
-            padding: 0 8px;
-            font-size: 18px;
-            font-weight: bold;
-            cursor: pointer;
-            border: none;
-            background: none;
-            color: #555;
-        }
-         #fs-manager-list li .item-menu-btn:hover {
-             color: #000;
-         }
         #fs-manager-toggle-btn {
             position: fixed;
             top: 10px;
@@ -124,42 +125,18 @@
         }
         .fs-manager-dir {
             font-weight: bold;
-            color: #0056b3; /* Blue for directories */
+            color: #0056b3;
         }
         .fs-manager-file {
-            color: #333; /* Default color for files */
+            color: #333;
         }
-
-        /* Context Menu Styles */
-        .fs-context-menu {
-            position: absolute;
-            background-color: #fff;
-            border: 1px solid #ccc;
-            box-shadow: 0 1px 5px rgba(0,0,0,0.15);
-            z-index: 10000; /* Above manager */
-            padding: 5px 0;
-            min-width: 120px;
-            list-style: none;
-            margin: 0;
+        /* 复选框样式 */
+        #fs-manager-list li input[type="checkbox"] {
+            margin-right: 5px;
         }
-        .fs-context-menu li {
-            padding: 6px 12px;
-            cursor: pointer;
-            font-size: 13px;
-            border-bottom: none; /* Override list item border */
-             display: block; /* Override flex */
-        }
-         .fs-context-menu li:hover {
-             background-color: #e8f0fe;
-         }
     `);
 
-    // --- State ---
-    let currentPath = initialPath;
-    let fsModule = null; // To store the Module.FS object
-    let activeContextMenu = null; // Reference to the currently open context menu
-
-    // --- UI Elements ---
+    // --- UI 元素创建 ---
     const container = document.createElement('div');
     container.id = 'fs-manager-container';
 
@@ -172,14 +149,27 @@
     pathDisplay.id = 'fs-manager-path';
     container.appendChild(pathDisplay);
 
+    // 控制面板（包含目录上移、创建、刷新、复制、移动、重命名、删除、导入、导出）
     const controls = document.createElement('div');
     controls.id = 'fs-manager-controls';
     controls.innerHTML = `
-        <button id="fs-manager-up-btn" title="Go to parent directory">Up</button>
-        <button id="fs-manager-mkdir-btn">Create Folder...</button>
-        <button id="fs-manager-refresh-btn" title="Refresh list">Refresh</button> `;
+        <button id="fs-manager-up-btn" title="返回上一级目录">上一级</button>
+        <button id="fs-manager-mkdir-btn">创建文件夹...</button>
+        <button id="fs-manager-refresh-btn" title="刷新列表">刷新</button>
+        <button id="fs-manager-move-btn" title="标记移动选中项">移动</button>
+        <button id="fs-manager-copy-btn" title="标记复制选中项">复制</button>
+        <button id="fs-manager-rename-btn" title="重命名单个选中项">重命名</button>
+        <button id="fs-manager-delete-btn" title="删除选中项">删除</button>
+        <button id="fs-manager-import-btn" title="导入本地文件">导入</button>
+        <button id="fs-manager-export-btn" title="导出选中项">导出</button>
+    `;
     container.appendChild(controls);
 
+    // 待执行操作按钮（常驻，当 pendingOp 不为空时显示）
+    const pendingOpBtn = document.createElement('button');
+    pendingOpBtn.id = 'fs-manager-pending-op-btn';
+    pendingOpBtn.style.display = 'none';
+    controls.appendChild(pendingOpBtn);
 
     const list = document.createElement('ul');
     list.id = 'fs-manager-list';
@@ -192,457 +182,472 @@
     toggleButton.textContent = toggleButtonText;
     document.body.appendChild(toggleButton);
 
-    // --- Helper Functions ---
-
-    // Basic path joining helper
+    // --- 辅助函数 ---
     function pathJoin(dir, item) {
-        if (!item) return dir; // Handle case where item might be empty
-        if (dir === '/') return `/${item.replace(/^\/+/, '')}`; // Avoid double slashes at root
-        return `${dir.replace(/\/+$/, '')}/${item.replace(/^\/+/, '')}`; // Avoid double slashes elsewhere
+        if (!item) return dir;
+        const dirClean = dir.replace(/\/+$/, '');
+        const itemClean = item.replace(/^\/+/, '');
+        if (dirClean === '' || dirClean === '/') return `/${itemClean}`;
+        return `${dirClean}/${itemClean}`;
     }
-
-    // Get base name from path
     function baseName(path) {
-        return path.split('/').pop();
+        return path.split('/').pop() || '';
     }
-
-    // Show alert message (can be customized later)
     function showMessage(message, type = 'info') {
         console[type === 'error' ? 'error' : 'log']('FS Manager:', message);
         alert(message);
     }
-
-    // Close any active context menu
-    function closeContextMenu() {
-        if (activeContextMenu) {
-            activeContextMenu.remove();
-            activeContextMenu = null;
-            document.removeEventListener('click', handleOutsideClick, true); // Remove the global listener
-        }
-    }
-
-    // Handler for clicks outside the context menu
-    function handleOutsideClick(event) {
-        if (activeContextMenu && !activeContextMenu.contains(event.target)) {
-            closeContextMenu();
-        }
-    }
-
-
-    // Create and show the context menu for an item
-    function createContextMenu(itemPath, isDir, event) {
-        event.stopPropagation(); // Prevent triggering li click (navigation)
-        closeContextMenu(); // Close any existing menu
-
-        const menu = document.createElement('ul');
-        menu.className = 'fs-context-menu';
-
-        const actions = [
-            { label: 'Rename / Move...', action: () => handleRename(itemPath, isDir) },
-            { label: 'Copy to...', action: () => handleCopy(itemPath, isDir) },
-            { label: 'Delete', action: () => handleDelete(itemPath, isDir) },
-        ];
-
-        actions.forEach(item => {
-            const menuItem = document.createElement('li');
-            menuItem.textContent = item.label;
-            menuItem.addEventListener('click', (e) => {
-                e.stopPropagation();
-                closeContextMenu();
-                item.action();
-            });
-            menu.appendChild(menuItem);
+    // 重置当前选中项（不清除 pending 状态）
+    function resetSelection() {
+        selectedItems = [];
+        document.querySelectorAll('#fs-manager-list input[type="checkbox"]').forEach(checkbox => {
+            checkbox.checked = false;
         });
-
-        // Positioning: Relative to the list container, near the click event
-        const listRect = list.getBoundingClientRect();
-        const managerRect = container.getBoundingClientRect();
-
-        // Calculate position relative to the viewport first
-        let top = event.clientY;
-        let left = event.clientX;
-
-         // Adjust position to be relative to the manager container's top-left
-         // This makes absolute positioning work within the scrolling list area
-         // Note: This might need fine-tuning based on exact layout/scrolling
-         menu.style.top = `${event.clientY - managerRect.top + list.scrollTop}px`;
-         menu.style.left = `${event.clientX - managerRect.left - 50}px`; // Offset slightly left
-
-        // Append to list container so it scrolls with the list
-        list.appendChild(menu);
-        activeContextMenu = menu;
-
-        // Add listener to close menu when clicking outside
-        // Use capture phase (true) to catch clicks before they might be stopped elsewhere
-        document.addEventListener('click', handleOutsideClick, true);
+    }
+    // 更新选中项（点击复选框时调用）
+    function updateSelection(itemPath, checked) {
+        if (checked) {
+            if (!selectedItems.includes(itemPath)) {
+                selectedItems.push(itemPath);
+            }
+        } else {
+            selectedItems = selectedItems.filter(p => p !== itemPath);
+        }
+        console.log("当前选中项：", selectedItems);
+    }
+    // 若输入为相对路径，则以当前目录合成绝对路径
+    function resolvePath(inputPath) {
+        if (!fsModule) return inputPath;
+        return inputPath.startsWith('/') ? inputPath : pathJoin(currentPath, inputPath);
     }
 
-
-    // Recursive copy function
+    // --- 文件操作函数 ---
+    // 封装复制单个文件函数
+    function copyFile(sourcePath, destPath) {
+        const data = fsModule.readFile(sourcePath);
+        fsModule.writeFile(destPath, data);
+    }
+    // 递归复制目录或文件
     function copyRecursive(sourcePath, destPath) {
-        if (!fsModule) throw new Error("Module.FS not available.");
-
         const stats = fsModule.stat(sourcePath);
         const isDir = fsModule.isDir(stats.mode);
-
         if (isDir) {
             try {
-                fsModule.mkdir(destPath); // Create destination directory
+                fsModule.mkdir(destPath);
             } catch (e) {
-                // Ignore error if directory already exists, throw others
                 if (e.code !== 'EEXIST') throw e;
             }
-
             const items = fsModule.readdir(sourcePath);
             items.forEach(item => {
                 if (item === '.' || item === '..') return;
-                copyRecursive(pathJoin(sourcePath, item), pathJoin(destPath, item)); // Recursive call
+                copyRecursive(pathJoin(sourcePath, item), pathJoin(destPath, item));
             });
         } else {
-            // It's a file, perform simple copy
-            const data = fsModule.readFile(sourcePath, { encoding: 'binary' });
-            fsModule.writeFile(destPath, data, { encoding: 'binary' });
-             // console.log(`Copied file ${sourcePath} to ${destPath}`);
+            copyFile(sourcePath, destPath);
         }
     }
 
-
-    // --- Action Handlers ---
-
-    function handleRename(oldPath, isDir) {
-         if (!fsModule) return;
-         const oldName = baseName(oldPath);
-         const itemType = isDir ? 'folder' : 'file';
-         const newName = prompt(`Enter new name or path for the ${itemType} "${oldName}":\n(Example: new_name or /some/other/path/new_name)`, oldName);
-
-         if (newName === null || newName.trim() === '' || newName === oldName) {
-             return; // User cancelled or entered invalid name
-         }
-
-         let newPath;
-         if (newName.includes('/')) {
-             // If it contains '/', treat it as a full path (absolute or relative needs careful thought, assume absolute if starts with /)
-             newPath = newName.startsWith('/') ? newName : pathJoin(fsModule.cwd(), newName); // Note: Using FS CWD might be needed for relative paths
-             // Simple approach: assume relative to current *manager* path if not starting with /
-             newPath = newName.startsWith('/') ? newName : pathJoin(currentPath, newName);
-
-         } else {
-             // Just a name change in the current directory
-             const parentDir = oldPath.substring(0, oldPath.lastIndexOf('/')) || '/';
-             newPath = pathJoin(parentDir, newName);
-         }
-
-         if (oldPath === newPath) return; // No change
-
-         try {
-             console.log(`FS Manager: Renaming/Moving "${oldPath}" to "${newPath}"`);
-             fsModule.rename(oldPath, newPath);
-             renderDirectory(currentPath); // Refresh view
-             showMessage(`Successfully renamed/moved "${oldName}" to "${baseName(newPath)}"`);
-         } catch (error) {
-             console.error(`FS Manager: Error renaming/moving ${oldPath} to ${newPath}:`, error);
-             showMessage(`Error renaming/moving:\n${error.message}`, 'error');
-         }
-    }
-
-     function handleDelete(itemPath, isDir) {
-         if (!fsModule) return;
-
-         const itemType = isDir ? 'folder' : 'file';
-         const itemName = baseName(itemPath);
-
-         // Extra caution for directories
-         let confirmMessage = `Are you sure you want to delete the ${itemType} "${itemName}"?`;
-         if (isDir) {
-             confirmMessage += "\n\nWarning: This action currently only works for EMPTY folders.";
-         }
-
-         if (!confirm(confirmMessage)) {
-             return;
-         }
-
-         try {
-             if (isDir) {
-                 // FS.rmdir only works on empty directories
-                 console.log(`FS Manager: Deleting directory "${itemPath}"`);
-                 fsModule.rmdir(itemPath);
-             } else {
-                 console.log(`FS Manager: Deleting file "${itemPath}"`);
-                 fsModule.unlink(itemPath);
-             }
-             renderDirectory(currentPath); // Refresh view
-             showMessage(`Successfully deleted ${itemType} "${itemName}"`);
-         } catch (error) {
-              console.error(`FS Manager: Error deleting ${itemPath}:`, error);
-              let message = error.message;
-              if (isDir && error.code === 'ENOTEMPTY') {
-                   message = "Folder is not empty. Cannot delete non-empty folders with this simple manager.";
-              }
-              showMessage(`Error deleting ${itemType}:\n${message}`, 'error');
-         }
-    }
-
-    function handleCopy(sourcePath, isDir) {
-        if (!fsModule) return;
-        const itemName = baseName(sourcePath);
-        const itemType = isDir ? 'folder' : 'file';
-
-        const suggestedDestName = itemName + (isDir ? '_copy' : '.copy');
-        const destinationPath = prompt(`Enter destination path/name to copy the ${itemType} "${itemName}" to:\n(Example: /target/folder or new_name_in_current_dir)`, pathJoin(currentPath, suggestedDestName));
-
-        if (!destinationPath || destinationPath.trim() === '' || destinationPath === sourcePath) {
-            showMessage("Copy cancelled or invalid destination.", 'info');
+    // --- 复制操作（两步） ---
+    // 第一步：点击“复制”按钮，保存当前选中项为 pendingItems 并设定 pendingOp 状态
+    function markCopy() {
+        if (selectedItems.length === 0) {
+            showMessage("请先选择需要复制的文件或目录。");
             return;
         }
-
-        // Check if destination exists (basic check)
-         try {
-            fsModule.stat(destinationPath);
-            if (!confirm(`Destination "${baseName(destinationPath)}" already exists. Overwrite?`)) {
-                showMessage("Copy cancelled.", 'info');
+        pendingOp = "copy";
+        pendingItems = selectedItems.slice();
+        pendingOpBtn.textContent = "复制到此处";
+        pendingOpBtn.style.display = "inline-block";
+        // showMessage("已标记复制操作，请进入目标目录后点击“复制到此处”按钮。");
+        resetSelection();
+    }
+    // 第二步：在目标目录点击待执行按钮，执行复制操作
+    function executeCopy() {
+        if (pendingOp !== "copy" || pendingItems.length === 0) {
+            showMessage("无待执行的复制操作。", "error");
+            return;
+        }
+        pendingItems.forEach(sourcePath => {
+            const name = baseName(sourcePath);
+            const destPath = pathJoin(currentPath, name);
+            if (sourcePath === destPath) {
+                console.warn(`跳过复制：源与目标相同 (${sourcePath})`);
                 return;
             }
-             // If confirmed, try to delete existing item first (carefully!)
-             try {
-                 const destStat = fsModule.stat(destinationPath);
-                 if (fsModule.isDir(destStat.mode)) {
-                      showMessage("Cannot overwrite a folder with a file/folder copy in this simple version. Please delete manually first.", 'error');
-                      return; // Avoid complex recursive delete for overwrite
-                 } else {
-                     fsModule.unlink(destinationPath); // Delete existing file
-                 }
-             } catch (deleteError) {
-                 // Ignore if delete failed (maybe didn't exist after all), proceed with copy attempt
-             }
-
-        } catch (e) {
-            // Doesn't exist or other stat error - OK to proceed
-             if (e.code !== 'ENOENT') {
-                  console.warn("FS Manager: Stat check failed unexpectedly:", e);
-             }
-        }
-
-
-        try {
-            console.log(`FS Manager: Copying "${sourcePath}" to "${destinationPath}"`);
-            showSpinner(true); // Show hypothetical spinner
-
-            // Use setTimeout to allow UI to update before potentially long copy
-            setTimeout(() => {
-                 try {
-                     copyRecursive(sourcePath, destinationPath);
-                     renderDirectory(currentPath); // Refresh view after copy completes
-                     showMessage(`Successfully copied "${itemName}" to "${baseName(destinationPath)}"`);
-                 } catch (copyError) {
-                    console.error(`FS Manager: Error during copy from ${sourcePath} to ${destinationPath}:`, copyError);
-                    showMessage(`Error copying ${itemType}:\n${copyError.message}`, 'error');
-                 } finally {
-                      showSpinner(false); // Hide spinner
-                 }
-            }, 10); // Small delay
-
-        } catch (error) { // Catch errors from initial checks or the setTimeout setup itself
-            console.error(`FS Manager: Error initiating copy from ${sourcePath} to ${destinationPath}:`, error);
-            showMessage(`Error starting copy:\n${error.message}`, 'error');
-            showSpinner(false);
-        }
+            try {
+                try {
+                    fsModule.stat(destPath);
+                    if (!confirm(`目标 "${name}" 已存在，是否覆盖？`)) return;
+                } catch(e) {
+                    // if (e.code !== 'ENOENT') throw e;
+                }
+                const stats = fsModule.stat(sourcePath);
+                if (fsModule.isDir(stats.mode)) {
+                    copyRecursive(sourcePath, destPath);
+                } else {
+                    copyFile(sourcePath, destPath);
+                }
+                console.log(`复制成功：${sourcePath} -> ${destPath}`);
+            } catch(err) {
+                console.error(`复制 "${name}" 出错：`, err);
+                showMessage(`复制 "${name}" 出错：${err.message}`, 'error');
+            }
+        });
+        pendingOp = null;
+        pendingItems = [];
+        pendingOpBtn.style.display = "none";
+        renderDirectory(currentPath);
+        showMessage("复制操作完成。");
     }
 
-
-    function handleMkdir() {
-         if (!fsModule) return;
-         const newDirName = prompt("Enter the name for the new folder:");
-
-         if (!newDirName || newDirName.trim() === '') {
-             showMessage("Folder creation cancelled or name empty.", 'info');
-             return;
-         }
-         const sanitizedName = newDirName.trim();
-
-         if (sanitizedName.includes('/')) {
-              showMessage("Folder name cannot contain '/'.", 'error');
-              return;
-         }
-
-         const newDirPath = pathJoin(currentPath, sanitizedName);
-
-         try {
-             console.log(`FS Manager: Creating directory "${newDirPath}"`);
-             fsModule.mkdir(newDirPath);
-             renderDirectory(currentPath); // Refresh view
-             showMessage(`Successfully created folder "${sanitizedName}"`);
-         } catch (error) {
-            // Check if it already exists
-             if (error.code === 'EEXIST') {
-                 showMessage(`Folder "${sanitizedName}" already exists.`, 'error');
-             } else {
-                console.error(`FS Manager: Error creating directory ${newDirPath}:`, error);
-                showMessage(`Error creating folder:\n${error.message}`, 'error');
-             }
-         }
-    }
-
-    // Navigate up one level
-    function handleUp() {
-        if (currentPath === '/') return;
-        // Find the last '/'
-        const lastSlashIndex = currentPath.lastIndexOf('/');
-        if (lastSlashIndex === 0) {
-             // Parent is root
-             renderDirectory('/');
-        } else if (lastSlashIndex > 0) {
-            // Parent is some other directory
-            const parentPath = currentPath.substring(0, lastSlashIndex);
-            renderDirectory(parentPath);
-        }
-         // If lastSlashIndex is -1 (shouldn't happen with absolute paths), do nothing
-    }
-
-    // Placeholder for a loading indicator
-    function showSpinner(show) {
-        // TODO: Implement a real visual indicator if needed
-        console.log(`Spinner: ${show ? 'ON' : 'OFF'}`);
-        container.style.opacity = show ? '0.8' : '1'; // Simple visual feedback
-        container.style.pointerEvents = show ? 'none' : 'auto';
-    }
-
-    // --- Render Function ---
-    function renderDirectory(path) {
-        if (!fsModule) {
-            console.error("FS Manager: Module.FS not available yet.");
-            list.innerHTML = '<li>Error: Module.FS not found. Retrying...</li>';
-            pathDisplay.textContent = `Path: ${path} (Error: FS not ready)`;
-            checkFSAvailability(); // Attempt to re-check
+    // --- 移动操作（两步） ---
+    // 第一步：点击“移动”按钮，保存当前选中项为 pendingItems 并设定 pendingOp 状态
+    function markMove() {
+        if (selectedItems.length === 0) {
+            showMessage("请先选择需要移动的文件或目录。");
             return;
         }
+        pendingOp = "move";
+        pendingItems = selectedItems.slice();
+        pendingOpBtn.textContent = "移动到此处";
+        pendingOpBtn.style.display = "inline-block";
+        // showMessage("已标记移动操作，请进入目标目录后点击“移动到此处”按钮。");
+        resetSelection();
+    }
+    // 第二步：在目标目录点击待执行按钮，执行移动操作
+    function executeMove() {
+        if (pendingOp !== "move" || pendingItems.length === 0) {
+            showMessage("无待执行的移动操作。", "error");
+            return;
+        }
+        pendingItems.forEach(sourcePath => {
+            const name = baseName(sourcePath);
+            const destPath = pathJoin(currentPath, name);
+            if (sourcePath === destPath) {
+                console.warn(`跳过移动：源与目标相同 (${sourcePath})`);
+                return;
+            }
+            try {
+                try {
+                    fsModule.stat(destPath);
+                    if (!confirm(`目标 "${name}" 已存在，是否覆盖？`)) return;
+                } catch(e) {
+                    // if (e.code !== 'ENOENT') throw e;
+                }
+                fsModule.rename(sourcePath, destPath);
 
-        closeContextMenu(); // Close menu when navigating
-        currentPath = path;
-        pathDisplay.textContent = `Path: ${currentPath}`;
-        list.innerHTML = ''; // Clear previous list
-        list.scrollTop = 0; // Reset scroll position
+                console.log(`移动成功：${sourcePath} -> ${destPath}`);
+            } catch(err) {
+                console.error(`移动 "${name}" 出错：`, err);
+                showMessage(`移动 "${name}" 出错：${err.message}`, 'error');
+            }
+        });
+        pendingOp = null;
+        pendingItems = [];
+        pendingOpBtn.style.display = "none";
+        renderDirectory(currentPath);
+        showMessage("移动操作完成。");
+    }
 
-        // Disable "Up" button if at root
-        document.getElementById('fs-manager-up-btn').disabled = (currentPath === '/');
-
+    // --- 重命名操作 ---
+    function doRenameAction() {
+        if (selectedItems.length !== 1) {
+            showMessage("请只选择一个文件或目录进行重命名。", 'error');
+            return;
+        }
+        const sourcePath = selectedItems[0];
+        const oldName = baseName(sourcePath);
+        const newName = prompt("请输入新的名称：", oldName);
+        if (!newName || newName.trim() === '') {
+            showMessage("重命名操作取消或名称为空。", 'info');
+            return;
+        }
+        if (newName.includes('/')) {
+            showMessage("名称中不能包含斜杠字符。", 'error');
+            return;
+        }
+        const destPath = pathJoin(currentPath, newName.trim());
+        if (sourcePath === destPath) {
+            showMessage("新名称与原名称相同。", 'info');
+            return;
+        }
         try {
-            const items = fsModule.readdir(currentPath);
-            const sortedItems = [];
-            const files = [];
+            try {
+                fsModule.stat(destPath);
+                if (!confirm(`目标 "${newName.trim()}" 已存在，是否覆盖？`)) return;
+            } catch(e) {
+                // if (e.code !== 'ENOENT') throw e;
+            }
+            fsModule.rename(sourcePath, destPath);
+            console.log(`重命名成功：${sourcePath} -> ${destPath}`);
+        } catch(err) {
+            console.error(`重命名 "${oldName}" 出错：`, err);
+            showMessage(`重命名 "${oldName}" 出错：${err.message}`, 'error');
+            return;
+        }
+        resetSelection();
+        renderDirectory(currentPath);
+        showMessage(`成功将 "${oldName}" 重命名为 "${newName.trim()}"`);
+    }
 
-            items.forEach(item => {
-                if (item === '.' || item === '..') return; // Skip . and ..
-                const itemPath = pathJoin(currentPath, item);
-                 try {
-                     const stats = fsModule.stat(itemPath);
-                     const isDir = fsModule.isDir(stats.mode);
-                     (isDir ? sortedItems : files).push({ name: item, path: itemPath, isDir: isDir }); // Group folders first
-                 } catch (statError) {
-                     console.warn(`FS Manager: Could not stat ${itemPath}:`, statError);
-                     // List it as a file with an error indicator? Or skip? Let's list as file.
-                     files.push({ name: item, path: itemPath, isDir: false, error: true });
-                 }
-            });
-
-            // Sort folders and files alphabetically within their groups
-            sortedItems.sort((a, b) => a.name.localeCompare(b.name));
-            files.sort((a, b) => a.name.localeCompare(b.name));
-
-            // Combine folders and files
-            const allItems = sortedItems.concat(files);
-
-
-            allItems.forEach(({ name, path: itemPath, isDir, error }) => {
-                const listItem = document.createElement('li');
-                listItem.dataset.name = name;
-                listItem.dataset.path = itemPath;
-                listItem.dataset.isdir = isDir;
-
-                const itemNameSpan = document.createElement('span');
-                itemNameSpan.className = 'item-name';
-                itemNameSpan.textContent = name + (isDir ? '/' : '') + (error ? ' ( inaccessible )' : '');
-                 itemNameSpan.classList.add(isDir ? 'fs-manager-dir' : 'fs-manager-file');
-
-                 if (isDir) {
-                     // Click on list item (but not menu button) to navigate
-                     listItem.addEventListener('click', (e) => {
-                         if (!e.target.classList.contains('item-menu-btn')) {
-                              renderDirectory(itemPath);
-                         }
-                     });
-                 } else {
-                      // Optional: Add click handler for files (e.g., view content)
-                 }
-                 listItem.appendChild(itemNameSpan);
-
-
-                // Menu Button
-                const menuBtn = document.createElement('button');
-                menuBtn.className = 'item-menu-btn';
-                menuBtn.textContent = menuIconChar;
-                menuBtn.title = 'Actions...';
-                menuBtn.addEventListener('click', (event) => createContextMenu(itemPath, isDir, event));
-                listItem.appendChild(menuBtn);
-
-                list.appendChild(listItem);
-            });
-
+    // --- 导入/导出 ---
+    function handleImport() {
+        if (!fsModule) return;
+        const fileInput = document.createElement('input');
+        fileInput.type = 'file';
+        fileInput.style.display = 'none';
+        fileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = function(evt) {
+                const data = evt.target.result;
+                const destPath = pathJoin(currentPath, file.name);
+                try {
+                    fsModule.writeFile(destPath, data);
+                    showMessage(`导入 "${file.name}" 成功。`);
+                    renderDirectory(currentPath);
+                } catch (error) {
+                    console.error(`导入 "${file.name}" 出错：`, error);
+                    showMessage(`导入 "${file.name}" 出错：${error.message}`, 'error');
+                }
+            };
+            reader.readAsBinaryString(file);
+        });
+        document.body.appendChild(fileInput);
+        fileInput.click();
+        fileInput.remove();
+    }
+    function handleExport() {
+        if (!fsModule) return;
+        if (selectedItems.length !== 1) {
+            showMessage("请仅选择一个文件进行导出。", 'error');
+            return;
+        }
+        const filePath = selectedItems[0];
+        let stats;
+        try {
+            stats = fsModule.stat(filePath);
         } catch (error) {
-            console.error(`FS Manager: Error reading directory ${currentPath}:`, error);
-            list.innerHTML = `<li>Error listing directory: ${error.message}</li>`;
-            showMessage(`Error listing directory "${currentPath}":\n${error.message}`, 'error');
+            showMessage("无法获取选中文件信息。", 'error');
+            return;
+        }
+        if (fsModule.isDir(stats.mode)) {
+            showMessage("目录不支持导出。", 'error');
+            return;
+        }
+        try {
+            const data = fsModule.readFile(filePath);
+            const blob = new Blob([data], { type: "application/octet-stream" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = baseName(filePath);
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => {
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+            }, 100);
+            showMessage(`文件 "${baseName(filePath)}" 导出成功。`);
+        } catch (error) {
+            console.error(`导出 "${baseName(filePath)}" 出错：`, error);
+            showMessage(`导出 "${baseName(filePath)}" 出错：${error.message}`, 'error');
         }
     }
 
-    // --- Event Listeners ---
+    // --- 目录渲染 ---
+    function renderDirectory(path) {
+        if (!fsModule) {
+            console.error("FS Manager: Module.FS 未就绪！");
+            list.innerHTML = '<li>错误：Module.FS 未找到，正在重试...</li>';
+            pathDisplay.textContent = `路径：${path} (错误：FS未就绪)`;
+            checkFSAvailability();
+            return;
+        }
+        // 清空当前选中项，但保留 pending 状态（如果有待执行操作，就让按钮继续显示）
+        resetSelection();
+        currentPath = path;
+        pathDisplay.textContent = `路径：${currentPath}`;
+        list.innerHTML = '';
+        document.getElementById('fs-manager-up-btn').disabled = (currentPath === '/');
+        try {
+            const items = fsModule.readdir(currentPath);
+            const folders = [];
+            const files = [];
+            items.forEach(item => {
+                if (item === '.' || item === '..') return;
+                const itemPath = pathJoin(currentPath, item);
+                try {
+                    const stats = fsModule.stat(itemPath);
+                    const isDir = fsModule.isDir(stats.mode);
+                    (isDir ? folders : files).push({ name: item, path: itemPath, isDir });
+                } catch (statError) {
+                    console.warn(`获取状态失败：${itemPath}`, statError);
+                    files.push({ name: item, path: itemPath, isDir: false, error: true });
+                }
+            });
+            folders.sort((a, b) => a.name.localeCompare(b.name));
+            files.sort((a, b) => a.name.localeCompare(b.name));
+            const allItems = folders.concat(files);
+            allItems.forEach(({ name, path: itemPath, isDir, error }) => {
+                const li = document.createElement('li');
+                const checkbox = document.createElement('input');
+                checkbox.type = 'checkbox';
+                checkbox.addEventListener('change', (e) => {
+                    updateSelection(itemPath, e.target.checked);
+                });
+                li.appendChild(checkbox);
+                const span = document.createElement('span');
+                span.className = 'item-name';
+                span.textContent = name + (isDir ? '/' : '') + (error ? ' (不可访问)' : '');
+                span.classList.add(isDir ? 'fs-manager-dir' : 'fs-manager-file');
+                li.appendChild(span);
+                if (isDir) {
+                    li.addEventListener('click', (e) => {
+                        if (e.target.tagName !== 'INPUT') {
+                            renderDirectory(itemPath);
+                        }
+                    });
+                }
+                list.appendChild(li);
+            });
+            // 如果 pendingOp 存在，则确保待执行按钮持续显示
+            if (pendingOp !== null) {
+                pendingOpBtn.style.display = "inline-block";
+            }
+        } catch (error) {
+            console.error(`读取目录 ${currentPath} 出错:`, error);
+            list.innerHTML = `<li>列出目录出错：${error.message}</li>`;
+            showMessage(`读取目录 "${currentPath}" 出错：${error.message}`, 'error');
+        }
+    }
+
+    // --- 事件绑定 ---
     toggleButton.addEventListener('click', () => {
         const isHidden = container.style.display === 'none';
         container.style.display = isHidden ? 'flex' : 'none';
-        if (isHidden && fsModule) {
-            renderDirectory(currentPath); // Refresh view when opened
-        } else if (isHidden && !fsModule) {
-            checkFSAvailability(); // Try to init if opened and not ready
-        } else if (!isHidden) {
-            closeContextMenu(); // Close menu when manager is hidden
+        if (isHidden) {
+            checkFSAvailability();
+            if (fsModule) renderDirectory(currentPath);
+        }
+    });
+    document.getElementById('fs-manager-close-btn').addEventListener('click', () => {
+        container.style.display = 'none';
+    });
+    document.getElementById('fs-manager-up-btn').addEventListener('click', () => {
+        if (currentPath === '/') return;
+        const lastSlash = currentPath.lastIndexOf('/');
+        renderDirectory(lastSlash === 0 ? '/' : currentPath.substring(0, lastSlash));
+    });
+    document.getElementById('fs-manager-mkdir-btn').addEventListener('click', () => {
+        if (!fsModule) return;
+        const newDirName = prompt("请输入新文件夹名称：");
+        if (!newDirName || newDirName.trim() === '') {
+            showMessage("创建文件夹操作取消或名称为空。", 'info');
+            return;
+        }
+        if (newDirName.includes('/')) {
+            showMessage("文件夹名称不能包含 '/'。", 'error');
+            return;
+        }
+        const newDirPath = pathJoin(currentPath, newDirName.trim());
+        try {
+            fsModule.mkdir(newDirPath);
+            renderDirectory(currentPath);
+            showMessage(`创建文件夹 "${newDirName.trim()}" 成功。`);
+        } catch (error) {
+            if (error.code === 'EEXIST') {
+                showMessage(`文件夹 "${newDirName.trim()}" 已存在。`, 'error');
+            } else {
+                console.error(`创建目录 ${newDirPath} 出错:`, error);
+                showMessage(`创建文件夹出错：${error.message}`, 'error');
+            }
+        }
+    });
+    document.getElementById('fs-manager-refresh-btn').addEventListener('click', () => {
+        if (fsModule) renderDirectory(currentPath);
+    });
+    // 复制、移动、重命名、删除、导入、导出
+    document.getElementById('fs-manager-copy-btn').addEventListener('click', markCopy);
+    document.getElementById('fs-manager-move-btn').addEventListener('click', markMove);
+    document.getElementById('fs-manager-rename-btn').addEventListener('click', doRenameAction);
+    document.getElementById('fs-manager-delete-btn').addEventListener('click', () => {
+        if (!fsModule) return;
+        if (selectedItems.length === 0) {
+            showMessage("请先选择需要删除的文件或目录。");
+            return;
+        }
+        if (!confirm("删除操作不可恢复，确认删除选中的项目吗？")) {
+            return;
+        }
+        selectedItems.forEach(itemPath => {
+            const name = baseName(itemPath);
+            try {
+                const stats = fsModule.stat(itemPath);
+                if (fsModule.isDir(stats.mode)) {
+                    fsModule.rmdir(itemPath);
+                } else {
+                    fsModule.unlink(itemPath);
+                }
+                console.log(`删除成功：${itemPath}`);
+            } catch (err) {
+                console.error(`删除失败：${itemPath}`, err);
+                showMessage(`删除 "${name}" 出错：${err.message}`, 'error');
+            }
+        });
+        renderDirectory(currentPath);
+        resetSelection();
+        showMessage("删除操作完成。");
+    });
+    document.getElementById('fs-manager-import-btn').addEventListener('click', handleImport);
+    document.getElementById('fs-manager-export-btn').addEventListener('click', handleExport);
+    // 待执行按钮，根据 pendingOp 分发复制或移动操作
+    pendingOpBtn.addEventListener('click', () => {
+        if (pendingOp === "copy") {
+            executeCopy();
+        } else if (pendingOp === "move") {
+            executeMove();
         }
     });
 
-    document.getElementById('fs-manager-close-btn').addEventListener('click', () => {
-        container.style.display = 'none';
-        closeContextMenu();
-    });
-
-    document.getElementById('fs-manager-up-btn').addEventListener('click', handleUp);
-    document.getElementById('fs-manager-mkdir-btn').addEventListener('click', handleMkdir);
-     document.getElementById('fs-manager-refresh-btn').addEventListener('click', () => renderDirectory(currentPath));
-
-
-    // --- Initialization ---
+    // --- FS 可用性检查 ---
     function checkFSAvailability() {
-        if (typeof Module !== 'undefined' && Module.FS && Module.callMain) { // Added check for callMain as FS might init late
-            console.log("FS Manager: Module.FS found!");
+        if (typeof Module !== 'undefined' && Module.FS &&
+            typeof Module.FS.stat === 'function' &&
+            typeof Module.FS.readdir === 'function' &&
+            typeof Module.FS.rename === 'function' &&
+            typeof Module.FS.writeFile === 'function' &&
+            typeof Module.FS.mkdir === 'function' &&
+            typeof Module.FS.isDir === 'function')
+        {
+            console.log("FS Manager: Module.FS 已就绪！");
             fsModule = Module.FS;
-            if (container.style.display === 'flex') {
-                 renderDirectory(currentPath);
-            } else {
-                pathDisplay.textContent = `Path: ${currentPath} (Ready)`;
+            try {
+                fsModule.stat(initialPath);
+                currentPath = initialPath;
+                console.log(`FS Manager: 初始路径 "${currentPath}" 验证成功。`);
+            } catch(e) {
+                console.warn(`FS Manager: 初始路径 "${initialPath}" 不可用，回退到根目录 '/'`, e);
+                currentPath = '/';
             }
-            // Clear the check interval if it was set
+            if (container.style.display === 'flex') {
+                renderDirectory(currentPath);
+            } else {
+                pathDisplay.textContent = `路径：${currentPath} (已就绪)`;
+            }
             if (window.fsManagerCheckInterval) {
                 clearInterval(window.fsManagerCheckInterval);
                 window.fsManagerCheckInterval = null;
             }
         } else {
-            console.log("FS Manager: Waiting for Module.FS...");
-            pathDisplay.textContent = `Path: ${currentPath} (Waiting for FS...)`;
-            // Use an interval for repeated checks if needed
+            console.log("FS Manager: 等待 Module.FS...");
+            pathDisplay.textContent = `路径：${currentPath} (等待 FS...)`;
             if (!window.fsManagerCheckInterval) {
-                 window.fsManagerCheckInterval = setInterval(checkFSAvailability, 1500); // Check periodically
+                window.fsManagerCheckInterval = setInterval(checkFSAvailability, 1500);
             }
         }
     }
-
-    // Initial check after document idle
-    setTimeout(checkFSAvailability, 500); // Delay initial check slightly
-
+    pathDisplay.textContent = `路径：${currentPath} (初始化...)`;
+    setTimeout(checkFSAvailability, 500);
 })();
